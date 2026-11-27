@@ -26,6 +26,22 @@ CAMPAIGNS_DB_FILE = "campaigns_db.json"
 VOICE_NAME = "en-US-BrianNeural"
 
 
+def get_youtube_client():
+    creds = Credentials(
+        token=None,
+        refresh_token=YT_REFRESH_TOKEN,
+        token_uri="https://oauth2.googleapis.com/token",
+        client_id=YT_CLIENT_ID,
+        client_secret=YT_CLIENT_SECRET,
+        scopes=[
+            "https://www.googleapis.com/auth/youtube.upload",
+            "https://www.googleapis.com/auth/youtube.readonly",
+        ],
+    )
+    creds.refresh(Request())
+    return build("youtube", "v3", credentials=creds)
+
+
 def load_used_videos() -> set:
     if not os.path.exists(USED_VIDEOS_FILE):
         return set()
@@ -52,14 +68,14 @@ def load_campaign_config(campaign_url: str, extra_notes: str) -> dict:
                 cfg["brief"] = f"{cfg.get('brief', '')}\n{extra_notes}".strip()
             return cfg
 
-    # Fallback if a brand-new campaign URL is pasted with brief notes
     return {
         "name": "Fundingpips Clipping",
         "promo_code": "FPMOVEMENT",
         "discount": "20% off",
         "search_queries": [
-            "prop firm funded trader payout interview podcast",
-            "forex funded trader strategy podcast",
+            "FundingPips funded trader interview podcast",
+            "prop firm funded trader payout interview",
+            "forex funded trader risk management podcast",
         ],
         "brief": extra_notes
         or "Highlight funded trading discipline, risk management, and mention code FPMOVEMENT for 20% off.",
@@ -67,46 +83,51 @@ def load_campaign_config(campaign_url: str, extra_notes: str) -> dict:
 
 
 def extract_video_id(url: str) -> str | None:
-    patterns = [
-        r"(?:v=|\/shorts\/|youtu\.be\/)([A-Za-z0-9_-]{11})",
-    ]
-    for pat in patterns:
-        m = re.search(pat, url)
-        if m:
-            return m.group(1)
-    return None
+    m = re.search(r"(?:v=|\/shorts\/|youtu\.be\/)([A-Za-z0-9_-]{11})", url)
+    return m.group(1) if m else None
 
 
-def find_candidate_video(campaign_url: str, cfg: dict, used_ids: set) -> tuple[str, str]:
+def find_candidate_video(
+    youtube, campaign_url: str, cfg: dict, used_ids: set
+) -> tuple[str, str]:
+    # 1. Direct YouTube URL passed in campaign_url
     direct_id = extract_video_id(campaign_url)
     if direct_id:
         return direct_id, f"https://www.youtube.com/watch?v={direct_id}"
 
+    # 2. Pre-approved source_videos list in campaigns_db.json
+    for src_url in cfg.get("source_videos", []):
+        vid = extract_video_id(src_url) or src_url.strip()
+        if vid and len(vid) == 11 and vid not in used_ids:
+            return vid, f"https://www.youtube.com/watch?v={vid}"
+
+    # 3. Official YouTube Data API v3 search (bypasses datacenter ytsearch blocks)
     queries = cfg.get("search_queries") or [
-        "prop firm funded trader interview podcast",
-        "day trading risk management podcast",
+        "FundingPips funded trader interview",
+        "prop firm trader payout interview podcast",
+        "day trading psychology risk management podcast",
     ]
     for query in queries:
-        cmd = [
-            "yt-dlp",
-            f"ytsearch10:{query}",
-            "--print",
-            "%(id)s|%(duration)s",
-            "--no-warnings",
-            "--ignore-errors",
-        ]
-        res = subprocess.run(cmd, capture_output=True, text=True)
-        for line in res.stdout.splitlines():
-            parts = line.strip().split("|")
-            if len(parts) != 2:
-                continue
-            vid, dur_str = parts
-            if vid in used_ids or not dur_str.isdigit():
-                continue
-            dur = int(dur_str)
-            # Prefer long-form podcast/interview videos (5 min to 3 hrs)
-            if 300 <= dur <= 10800:
-                return vid, f"https://www.youtube.com/watch?v={vid}"
+        try:
+            search_resp = (
+                youtube.search()
+                .list(
+                    part="snippet",
+                    q=query,
+                    type="video",
+                    videoDuration="long",
+                    videoCaption="closedCaption",
+                    relevanceLanguage="en",
+                    maxResults=10,
+                )
+                .execute()
+            )
+            for item in search_resp.get("items", []):
+                vid = item.get("id", {}).get("videoId")
+                if vid and vid not in used_ids:
+                    return vid, f"https://www.youtube.com/watch?v={vid}"
+        except Exception as e:
+            print(f"YouTube API search warning for '{query}': {e}")
 
     raise RuntimeError("No unused candidate YouTube videos found for campaign queries.")
 
@@ -184,7 +205,6 @@ def download_and_render_clip(
     ]
     subprocess.run(dl_cmd, check=True)
 
-    # Vertical 1080x1920 crop, mute original audio, mix US voiceover, burn #ad disclosure
     vf_filter = (
         "scale=1080:1920:force_original_aspect_ratio=increase,"
         "crop=1080:1920,"
@@ -220,18 +240,7 @@ def download_and_render_clip(
     subprocess.run(ff_cmd, check=True)
 
 
-def upload_to_youtube(video_path: str, title: str, description: str) -> str:
-    creds = Credentials(
-        token=None,
-        refresh_token=YT_REFRESH_TOKEN,
-        token_uri="https://oauth2.googleapis.com/token",
-        client_id=YT_CLIENT_ID,
-        client_secret=YT_CLIENT_SECRET,
-        scopes=["https://www.googleapis.com/auth/youtube.upload"],
-    )
-    creds.refresh(Request())
-    youtube = build("youtube", "v3", credentials=creds)
-
+def upload_to_youtube(youtube, video_path: str, title: str, description: str) -> str:
     body = {
         "snippet": {
             "title": title[:95],
@@ -298,10 +307,11 @@ def main() -> None:
     if not CAMPAIGN_URL:
         raise ValueError("CAMPAIGN_URL environment variable is empty.")
 
+    youtube = get_youtube_client()
     cfg = load_campaign_config(CAMPAIGN_URL, EXTRA_BRIEF_NOTES)
     used_ids = load_used_videos()
 
-    video_id, video_url = find_candidate_video(CAMPAIGN_URL, cfg, used_ids)
+    video_id, video_url = find_candidate_video(youtube, CAMPAIGN_URL, cfg, used_ids)
     print(f"Selected source video: {video_url}")
 
     transcript = fetch_transcript(video_id)
@@ -315,7 +325,7 @@ def main() -> None:
         video_url, plan["start_sec"], plan["duration_sec"], vo_file, final_file
     )
 
-    yt_url = upload_to_youtube(final_file, plan["title"], plan["caption"])
+    yt_url = upload_to_youtube(youtube, final_file, plan["title"], plan["caption"])
     tt_status = upload_to_tiktok_inbox(final_file)
 
     save_used_video(video_id)
