@@ -3,7 +3,6 @@ import re
 import json
 import asyncio
 import subprocess
-import xml.etree.ElementTree as ET
 import requests
 import edge_tts
 from youtube_transcript_api import YouTubeTranscriptApi
@@ -26,23 +25,8 @@ USED_VIDEOS_FILE = "used_videos.txt"
 CAMPAIGNS_DB_FILE = "campaigns_db.json"
 VOICE_NAME = "en-US-BrianNeural"
 
-# Public YouTube RSS feeds for prop-firm & funded trading podcasts (no API scope required)
-DEFAULT_CHANNEL_IDS = [
-    "UC0-1_W8Q5Z3n3E5E9H0jK4Q",  # FundingPips Official
-    "UCf2k2gX0r5k5G8e8h8Y5g6A",  # Words of Rizdom (Prop Firm & Trader Interviews)
-    "UC9-y-6csu5WGm29I7JiwpnA",  # Desire To Trade Podcast
-    "UC1511124567890123456789",  # Fallback slot
-]
-
-# Verified public prop-firm / trading podcast channel IDs & seed videos
-VERIFIED_FEEDS = [
-    "https://www.youtube.com/feeds/videos.xml?channel_id=UCh8qgQ1k9Q1q5n9v7l1l3wQ",
-    "https://www.youtube.com/feeds/videos.xml?user=FundingPips",
-]
-
 SEED_VIDEO_IDS = [
     "oxDmU029fBI",
-    "jNQXAC9IVRw",
 ]
 
 
@@ -105,7 +89,6 @@ def extract_video_id(url: str) -> str | None:
 
 
 def scrape_youtube_ids_from_html(query: str) -> list[str]:
-    """Fetch candidate video IDs directly from YouTube search HTML without yt-dlp search or extra OAuth scopes."""
     try:
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
@@ -113,7 +96,7 @@ def scrape_youtube_ids_from_html(query: str) -> list[str]:
         }
         resp = requests.get(
             "https://www.youtube.com/results",
-            params={"search_query": query, "sp": "EgIYAg%253D%253D"},  # Long videos (>20 min)
+            params={"search_query": query, "sp": "EgIYAg%253D%253D"},
             headers=headers,
             timeout=20,
         )
@@ -128,35 +111,76 @@ def scrape_youtube_ids_from_html(query: str) -> list[str]:
         return []
 
 
-def fetch_transcript(video_id: str) -> list[dict]:
-    api = YouTubeTranscriptApi()
-    transcript = api.fetch(video_id, languages=["en", "en-US", "en-GB"])
-    return [
-        {"start": item.start, "duration": item.duration, "text": item.text}
-        for item in transcript
-    ]
+def fetch_transcript_or_metadata(video_id: str) -> tuple[str, int] | None:
+    """Try transcript first; if cloud IP is blocked, fall back to yt-dlp Android client metadata."""
+    # 1. Try YouTubeTranscriptApi
+    try:
+        api = YouTubeTranscriptApi()
+        transcript = api.fetch(video_id, languages=["en", "en-US", "en-GB"])
+        lines = [
+            f"[{int(item.start)}s] {item.text}"
+            for item in transcript
+            if item.start <= 3600
+        ]
+        if len(lines) >= 15:
+            duration = int(transcript[-1].start + transcript[-1].duration)
+            return "\n".join(lines[:450]), duration
+    except Exception as e:
+        print(f"Transcript unavailable for {video_id} ({type(e).__name__}), checking yt-dlp Android metadata...")
+
+    # 2. Fallback: yt-dlp with Android client (bypasses Azure datacenter IP blocks)
+    try:
+        cmd = [
+            "yt-dlp",
+            "--extractor-args",
+            "youtube:player_client=android,web",
+            "--dump-single-json",
+            "--no-warnings",
+            f"https://www.youtube.com/watch?v={video_id}",
+        ]
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        if res.returncode == 0 and res.stdout.strip():
+            info = json.loads(res.stdout)
+            duration = int(info.get("duration") or 0)
+            if duration < 180:  # Skip Shorts/teasers under 3 min
+                return None
+            title = info.get("title", "")
+            desc = (info.get("description") or "")[:2500]
+            chapters = info.get("chapters") or []
+            chap_text = "\n".join(
+                f"[{int(c.get('start_time', 0))}s] {c.get('title', '')}"
+                for c in chapters
+            )
+            context_block = (
+                f"Video Title: {title}\n"
+                f"Total Duration: {duration}s\n"
+                f"Chapters:\n{chap_text or 'None'}\n\n"
+                f"Description:\n{desc}"
+            )
+            return context_block, duration
+    except Exception as e:
+        print(f"Metadata check failed for {video_id}: {e}")
+
+    return None
 
 
-def find_video_with_transcript(
+def find_candidate_with_context(
     campaign_url: str, cfg: dict, used_ids: set
-) -> tuple[str, str, list[dict]]:
+) -> tuple[str, str, str, int]:
     candidates = []
 
-    # 1. Direct YouTube URL if user pasted one
     direct_id = extract_video_id(campaign_url)
     if direct_id:
         candidates.append(direct_id)
 
-    # 2. Any source_videos configured in campaigns_db.json
     for src in cfg.get("source_videos", []):
         vid = extract_video_id(src) or src.strip()
         if vid and len(vid) == 11 and vid not in candidates:
             candidates.append(vid)
 
-    # 3. Search YouTube HTML for campaign queries
     queries = cfg.get("search_queries") or [
-        "FundingPips funded trader interview podcast",
-        "prop firm funded trader payout interview",
+        "FundingPips funded trader interview",
+        "prop firm trader payout podcast",
         "forex trading psychology podcast",
     ]
     for q in queries:
@@ -164,36 +188,28 @@ def find_video_with_transcript(
             if vid not in candidates:
                 candidates.append(vid)
 
-    # 4. Fallback seed videos
     for vid in SEED_VIDEO_IDS:
         if vid not in candidates:
             candidates.append(vid)
 
-    for vid in candidates:
+    for vid in candidates[:12]:
         if vid in used_ids and vid != direct_id:
             continue
-        try:
-            transcript = fetch_transcript(vid)
-            if len(transcript) >= 15:
-                return vid, f"https://www.youtube.com/watch?v={vid}", transcript
-        except Exception as e:
-            print(f"Skipping {vid} (no usable English transcript): {e}")
+        result = fetch_transcript_or_metadata(vid)
+        if result:
+            context_text, duration = result
+            return vid, f"https://www.youtube.com/watch?v={vid}", context_text, duration
 
-    raise RuntimeError("Could not find an unused video with an English transcript.")
+    raise RuntimeError("Could not retrieve usable video metadata from any candidate.")
 
 
-def analyze_with_gemini(transcript: list[dict], cfg: dict) -> dict:
+def analyze_with_gemini(context_text: str, total_duration: int, cfg: dict) -> dict:
     client = genai.Client(api_key=GEMINI_API_KEY)
-    compact_lines = [
-        f"[{int(seg['start'])}s] {seg['text']}"
-        for seg in transcript
-        if seg["start"] <= 3600
-    ]
-    transcript_block = "\n".join(compact_lines[:450])
+    max_start = max(60, min(total_duration - 45, 2400))
 
     prompt = f"""
 You are a viral short-form finance & trading editor for @capitaldecoded13.
-Analyze the podcast transcript below and pick ONE high-retention 28-to-35 second segment.
+Using the video transcript/chapters/metadata below, pick ONE high-retention 28-to-35 second visual segment (start_sec between 45 and {max_start}).
 
 Campaign: {cfg.get('name', 'Fundingpips Clipping')}
 Promo Code: {cfg.get('promo_code', 'FPMOVEMENT')} ({cfg.get('discount', '20% off')})
@@ -201,15 +217,15 @@ Brief Rules: {cfg.get('brief', '')}
 
 Return ONLY valid JSON with these exact keys:
 {{
-  "start_sec": <integer start timestamp in seconds>,
+  "start_sec": <integer start timestamp in seconds between 45 and {max_start}>,
   "duration_sec": <integer between 28 and 35>,
-  "voiceover_script": "<punchy 65-75 word US English narration summarizing the insight and naturally mentioning code {cfg.get('promo_code', 'FPMOVEMENT')} for {cfg.get('discount', '20% off')}>",
+  "voiceover_script": "<punchy 65-75 word US English narration delivering a high-value funded trading insight from this interview and naturally mentioning code {cfg.get('promo_code', 'FPMOVEMENT')} for {cfg.get('discount', '20% off')}>",
   "title": "<YouTube Shorts title under 70 chars including #Shorts #ad>",
   "caption": "<TikTok/Shorts description with #ad #trading #propfirm #finance and promo code {cfg.get('promo_code', 'FPMOVEMENT')}>"
 }}
 
-Transcript:
-{transcript_block}
+Source Context:
+{context_text}
 """
     response = client.models.generate_content(
         model="gemini-2.5-flash",
@@ -217,7 +233,7 @@ Transcript:
         config={"response_mime_type": "application/json"},
     )
     data = json.loads(response.text)
-    data["start_sec"] = max(0, int(data.get("start_sec", 60)))
+    data["start_sec"] = max(30, min(max_start, int(data.get("start_sec", 90))))
     data["duration_sec"] = min(40, max(25, int(data.get("duration_sec", 30))))
     return data
 
@@ -235,6 +251,8 @@ def download_and_render_clip(
 
     dl_cmd = [
         "yt-dlp",
+        "--extractor-args",
+        "youtube:player_client=android,web",
         "-f",
         "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
         "--download-sections",
@@ -351,12 +369,12 @@ def main() -> None:
     cfg = load_campaign_config(CAMPAIGN_URL, EXTRA_BRIEF_NOTES)
     used_ids = load_used_videos()
 
-    video_id, video_url, transcript = find_video_with_transcript(
+    video_id, video_url, context_text, total_duration = find_candidate_with_context(
         CAMPAIGN_URL, cfg, used_ids
     )
-    print(f"Selected source video: {video_url} ({len(transcript)} transcript segments)")
+    print(f"Selected source video: {video_url} ({total_duration}s)")
 
-    plan = analyze_with_gemini(transcript, cfg)
+    plan = analyze_with_gemini(context_text, total_duration, cfg)
     print(f"Gemini selected {plan['start_sec']}s for {plan['duration_sec']}s")
 
     vo_file = "voiceover.mp3"
