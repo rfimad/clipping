@@ -1,20 +1,20 @@
 import os
-import re
+import glob
 import json
+import time
 import asyncio
 import subprocess
 import requests
+import gdown
 import edge_tts
-from youtube_transcript_api import YouTubeTranscriptApi
 from google import genai
 from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 
-# 1. Load environment inputs & secrets
-CAMPAIGN_URL = os.environ.get("CAMPAIGN_URL", "").strip()
-EXTRA_BRIEF_NOTES = os.environ.get("EXTRA_BRIEF_NOTES", "").strip()
+VIDEO_URL = os.environ.get("VIDEO_URL", "").strip()
+CAMPAIGN_NOTES = os.environ.get("CAMPAIGN_NOTES", "").strip()
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
 YT_CLIENT_ID = os.environ.get("YT_CLIENT_ID", "").strip()
 YT_CLIENT_SECRET = os.environ.get("YT_CLIENT_SECRET", "").strip()
@@ -22,12 +22,9 @@ YT_REFRESH_TOKEN = os.environ.get("YT_REFRESH_TOKEN", "").strip()
 TIKTOK_ACCESS_TOKEN = os.environ.get("TIKTOK_ACCESS_TOKEN", "").strip()
 
 USED_VIDEOS_FILE = "used_videos.txt"
-CAMPAIGNS_DB_FILE = "campaigns_db.json"
 VOICE_NAME = "en-US-BrianNeural"
-
-SEED_VIDEO_IDS = [
-    "oxDmU029fBI",
-]
+DRIVE_DIR = "drive_footage"
+VIDEO_EXTS = ("*.mp4", "*.mov", "*.mkv", "*.webm", "*.m4v")
 
 
 def get_youtube_upload_client():
@@ -43,198 +40,117 @@ def get_youtube_upload_client():
     return build("youtube", "v3", credentials=creds)
 
 
-def load_used_videos() -> set:
+def load_used_items() -> set:
     if not os.path.exists(USED_VIDEOS_FILE):
         return set()
     with open(USED_VIDEOS_FILE, "r", encoding="utf-8") as f:
         return {line.strip() for line in f if line.strip()}
 
 
-def save_used_video(video_id: str) -> None:
+def save_used_item(item_key: str) -> None:
     with open(USED_VIDEOS_FILE, "a", encoding="utf-8") as f:
-        f.write(f"{video_id}\n")
+        f.write(f"{item_key}\n")
 
 
-def load_campaign_config(campaign_url: str, extra_notes: str) -> dict:
-    db = {}
-    if os.path.exists(CAMPAIGNS_DB_FILE):
-        with open(CAMPAIGNS_DB_FILE, "r", encoding="utf-8") as f:
-            raw = json.load(f)
-            db = raw if isinstance(raw, dict) else {c.get("url", ""): c for c in raw}
+def download_from_google_drive(drive_url: str, used_items: set) -> tuple[str, str]:
+    if not drive_url:
+        raise ValueError("VIDEO_URL is empty. Paste a Google Drive file or folder link.")
 
-    for key, val in db.items():
-        if key and (key in campaign_url or campaign_url in key):
-            cfg = dict(val)
-            if extra_notes:
-                cfg["brief"] = f"{cfg.get('brief', '')}\n{extra_notes}".strip()
-            return cfg
+    os.makedirs(DRIVE_DIR, exist_ok=True)
 
-    return {
-        "name": "Fundingpips Clipping",
-        "promo_code": "FPMOVEMENT",
-        "discount": "20% off",
-        "search_queries": [
-            "FundingPips funded trader interview",
-            "prop firm trader payout podcast",
-            "day trading risk management podcast",
-        ],
-        "brief": extra_notes
-        or "Highlight funded trading discipline, risk management, and mention code FPMOVEMENT for 20% off.",
-    }
-
-
-def extract_video_id(url: str) -> str | None:
-    m = re.search(r"(?:v=|\/shorts\/|youtu\.be\/)([A-Za-z0-9_-]{11})", url)
-    return m.group(1) if m else None
-
-
-def scrape_youtube_ids_from_html(query: str) -> list[str]:
-    try:
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
-            "Accept-Language": "en-US,en;q=0.9",
-        }
-        resp = requests.get(
-            "https://www.youtube.com/results",
-            params={"search_query": query, "sp": "EgIYAg%253D%253D"},
-            headers=headers,
-            timeout=20,
+    if "/folders/" in drive_url:
+        gdown.download_folder(
+            url=drive_url,
+            output=DRIVE_DIR,
+            quiet=False,
+            use_cookies=False,
+            remaining_ok=True,
         )
-        ids = re.findall(r'"videoId":"([A-Za-z0-9_-]{11})"', resp.text)
-        seen = []
-        for vid in ids:
-            if vid not in seen:
-                seen.append(vid)
-        return seen
-    except Exception as e:
-        print(f"HTML search warning for '{query}': {e}")
-        return []
+    else:
+        out_path = os.path.join(DRIVE_DIR, "input_video.mp4")
+        gdown.download(url=drive_url, output=out_path, quiet=False, fuzzy=True)
+
+    files = []
+    for ext in VIDEO_EXTS:
+        files.extend(glob.glob(os.path.join(DRIVE_DIR, "**", ext), recursive=True))
+    files = sorted(set(files))
+
+    if not files:
+        raise RuntimeError(
+            "No video files (.mp4/.mov/.mkv) were downloaded from that Google Drive URL. "
+            "Ensure the Drive link is shared as 'Anyone with the link'."
+        )
+
+    for path in files:
+        fname = os.path.basename(path)
+        if fname not in used_items:
+            return path, fname
+
+    return files[0], os.path.basename(files[0])
 
 
-def fetch_transcript_or_metadata(video_id: str) -> tuple[str, int] | None:
-    """Try transcript first; if cloud IP is blocked, fall back to yt-dlp Android client metadata."""
-    # 1. Try YouTubeTranscriptApi
-    try:
-        api = YouTubeTranscriptApi()
-        transcript = api.fetch(video_id, languages=["en", "en-US", "en-GB"])
-        lines = [
-            f"[{int(item.start)}s] {item.text}"
-            for item in transcript
-            if item.start <= 3600
-        ]
-        if len(lines) >= 15:
-            duration = int(transcript[-1].start + transcript[-1].duration)
-            return "\n".join(lines[:450]), duration
-    except Exception as e:
-        print(f"Transcript unavailable for {video_id} ({type(e).__name__}), checking yt-dlp Android metadata...")
-
-    # 2. Fallback: yt-dlp with Android client (bypasses Azure datacenter IP blocks)
-    try:
-        cmd = [
-            "yt-dlp",
-            "--extractor-args",
-            "youtube:player_client=android,web",
-            "--dump-single-json",
-            "--no-warnings",
-            f"https://www.youtube.com/watch?v={video_id}",
-        ]
-        res = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-        if res.returncode == 0 and res.stdout.strip():
-            info = json.loads(res.stdout)
-            duration = int(info.get("duration") or 0)
-            if duration < 180:  # Skip Shorts/teasers under 3 min
-                return None
-            title = info.get("title", "")
-            desc = (info.get("description") or "")[:2500]
-            chapters = info.get("chapters") or []
-            chap_text = "\n".join(
-                f"[{int(c.get('start_time', 0))}s] {c.get('title', '')}"
-                for c in chapters
-            )
-            context_block = (
-                f"Video Title: {title}\n"
-                f"Total Duration: {duration}s\n"
-                f"Chapters:\n{chap_text or 'None'}\n\n"
-                f"Description:\n{desc}"
-            )
-            return context_block, duration
-    except Exception as e:
-        print(f"Metadata check failed for {video_id}: {e}")
-
-    return None
-
-
-def find_candidate_with_context(
-    campaign_url: str, cfg: dict, used_ids: set
-) -> tuple[str, str, str, int]:
-    candidates = []
-
-    direct_id = extract_video_id(campaign_url)
-    if direct_id:
-        candidates.append(direct_id)
-
-    for src in cfg.get("source_videos", []):
-        vid = extract_video_id(src) or src.strip()
-        if vid and len(vid) == 11 and vid not in candidates:
-            candidates.append(vid)
-
-    queries = cfg.get("search_queries") or [
-        "FundingPips funded trader interview",
-        "prop firm trader payout podcast",
-        "forex trading psychology podcast",
+def get_video_duration(video_path: str) -> int:
+    cmd = [
+        "ffprobe",
+        "-v",
+        "error",
+        "-show_entries",
+        "format=duration",
+        "-of",
+        "default=noprint_wrappers=1:nokey=1",
+        video_path,
     ]
-    for q in queries:
-        for vid in scrape_youtube_ids_from_html(q):
-            if vid not in candidates:
-                candidates.append(vid)
-
-    for vid in SEED_VIDEO_IDS:
-        if vid not in candidates:
-            candidates.append(vid)
-
-    for vid in candidates[:12]:
-        if vid in used_ids and vid != direct_id:
-            continue
-        result = fetch_transcript_or_metadata(vid)
-        if result:
-            context_text, duration = result
-            return vid, f"https://www.youtube.com/watch?v={vid}", context_text, duration
-
-    raise RuntimeError("Could not retrieve usable video metadata from any candidate.")
+    res = subprocess.run(cmd, capture_output=True, text=True, check=True)
+    return max(10, int(float(res.stdout.strip())))
 
 
-def analyze_with_gemini(context_text: str, total_duration: int, cfg: dict) -> dict:
+def analyze_video_with_gemini(video_path: str, duration_sec: int, notes: str) -> dict:
     client = genai.Client(api_key=GEMINI_API_KEY)
-    max_start = max(60, min(total_duration - 45, 2400))
+
+    sample_audio = "drive_audio.mp3"
+    subprocess.run(
+        ["ffmpeg", "-y", "-i", video_path, "-vn", "-ac", "1", "-b:a", "48k", sample_audio],
+        check=True,
+    )
+
+    uploaded = client.files.upload(file=sample_audio)
+    while uploaded.state.name == "PROCESSING":
+        time.sleep(2)
+        uploaded = client.files.get(name=uploaded.name)
+
+    clip_len = min(32, duration_sec)
+    max_start = max(0, duration_sec - clip_len)
+    brief_text = (
+        notes
+        or "Campaign: Fundingpips Clipping | Promo Code: FPMOVEMENT (20% off) | "
+        "Highlight funded trading discipline, risk management, and mention code FPMOVEMENT for 20% off."
+    )
 
     prompt = f"""
 You are a viral short-form finance & trading editor for @capitaldecoded13.
-Using the video transcript/chapters/metadata below, pick ONE high-retention 28-to-35 second visual segment (start_sec between 45 and {max_start}).
+Listen to this video's audio track (total duration {duration_sec}s) and pick ONE high-retention {clip_len}-second segment (start_sec between 0 and {max_start}).
 
-Campaign: {cfg.get('name', 'Fundingpips Clipping')}
-Promo Code: {cfg.get('promo_code', 'FPMOVEMENT')} ({cfg.get('discount', '20% off')})
-Brief Rules: {cfg.get('brief', '')}
+Campaign Brief & Rules:
+{brief_text}
 
 Return ONLY valid JSON with these exact keys:
 {{
-  "start_sec": <integer start timestamp in seconds between 45 and {max_start}>,
-  "duration_sec": <integer between 28 and 35>,
-  "voiceover_script": "<punchy 65-75 word US English narration delivering a high-value funded trading insight from this interview and naturally mentioning code {cfg.get('promo_code', 'FPMOVEMENT')} for {cfg.get('discount', '20% off')}>",
+  "start_sec": <integer start timestamp in seconds between 0 and {max_start}>,
+  "duration_sec": <integer between {min(25, clip_len)} and {clip_len}>,
+  "overlay_tag": "<short top-left disclosure badge under 28 chars, e.g. #ad | Code FPMOVEMENT>",
+  "voiceover_script": "<punchy 60-75 word US English narration summarizing the key insight from this clip and following the campaign brief>",
   "title": "<YouTube Shorts title under 70 chars including #Shorts #ad>",
-  "caption": "<TikTok/Shorts description with #ad #trading #propfirm #finance and promo code {cfg.get('promo_code', 'FPMOVEMENT')}>"
+  "caption": "<TikTok/Shorts description with #ad #trading #finance and campaign promo code>"
 }}
-
-Source Context:
-{context_text}
 """
     response = client.models.generate_content(
         model="gemini-2.5-flash",
-        contents=prompt,
+        contents=[uploaded, prompt],
         config={"response_mime_type": "application/json"},
     )
     data = json.loads(response.text)
-    data["start_sec"] = max(30, min(max_start, int(data.get("start_sec", 90))))
-    data["duration_sec"] = min(40, max(25, int(data.get("duration_sec", 30))))
+    data["start_sec"] = max(0, min(max_start, int(data.get("start_sec", 0))))
+    data["duration_sec"] = max(10, min(duration_sec, int(data.get("duration_sec", clip_len))))
     return data
 
 
@@ -243,38 +159,30 @@ async def generate_voiceover(text: str, out_mp3: str) -> None:
     await communicate.save(out_mp3)
 
 
-def download_and_render_clip(
-    video_url: str, start_sec: int, duration_sec: int, vo_mp3: str, final_mp4: str
+def render_vertical_clip(
+    source_path: str,
+    start_sec: int,
+    duration_sec: int,
+    overlay_tag: str,
+    vo_mp3: str,
+    final_mp4: str,
 ) -> None:
-    raw_clip = "raw_slice.mp4"
-    end_sec = start_sec + duration_sec
-
-    dl_cmd = [
-        "yt-dlp",
-        "--extractor-args",
-        "youtube:player_client=android,web",
-        "-f",
-        "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
-        "--download-sections",
-        f"*{start_sec}-{end_sec}",
-        "--force-keyframes-at-cuts",
-        "-o",
-        raw_clip,
-        video_url,
-    ]
-    subprocess.run(dl_cmd, check=True)
-
+    safe_tag = overlay_tag.replace(":", "").replace("'", "").strip() or "#ad | Code FPMOVEMENT"
     vf_filter = (
         "scale=1080:1920:force_original_aspect_ratio=increase,"
         "crop=1080:1920,"
-        "drawtext=text='#ad | Code FPMOVEMENT':fontcolor=white:fontsize=34:"
+        f"drawtext=text='{safe_tag}':fontcolor=white:fontsize=34:"
         "box=1:boxcolor=black@0.55:boxborderw=10:x=40:y=60"
     )
     ff_cmd = [
         "ffmpeg",
         "-y",
+        "-ss",
+        str(start_sec),
+        "-t",
+        str(duration_sec),
         "-i",
-        raw_clip,
+        source_path,
         "-i",
         vo_mp3,
         "-filter_complex",
@@ -315,8 +223,7 @@ def upload_to_youtube(youtube, video_path: str, title: str, description: str) ->
     media = MediaFileUpload(video_path, chunksize=-1, resumable=True, mimetype="video/mp4")
     req = youtube.videos().insert(part="snippet,status", body=body, media_body=media)
     resp = req.execute()
-    vid = resp.get("id", "")
-    return f"https://youtube.com/shorts/{vid}"
+    return f"https://youtube.com/shorts/{resp.get('id', '')}"
 
 
 def upload_to_tiktok_inbox(video_path: str) -> str:
@@ -328,72 +235,70 @@ def upload_to_tiktok_inbox(video_path: str) -> str:
         "Authorization": f"Bearer {TIKTOK_ACCESS_TOKEN}",
         "Content-Type": "application/json; charset=UTF-8",
     }
-    init_payload = {
-        "source_info": {
-            "source": "FILE_UPLOAD",
-            "video_size": file_size,
-            "chunk_size": file_size,
-            "total_chunk_count": 1,
-        }
-    }
     init_res = requests.post(
         "https://open.tiktokapis.com/v2/post/publish/inbox/video/init/",
         headers=headers,
-        json=init_payload,
+        json={
+            "source_info": {
+                "source": "FILE_UPLOAD",
+                "video_size": file_size,
+                "chunk_size": file_size,
+                "total_chunk_count": 1,
+            }
+        },
         timeout=30,
     ).json()
 
     data = init_res.get("data", {})
     upload_url = data.get("upload_url")
-    publish_id = data.get("publish_id", "")
     if not upload_url:
         return f"TikTok Init Warning: {init_res}"
 
     with open(video_path, "rb") as vf:
-        video_bytes = vf.read()
-
-    put_headers = {
-        "Content-Range": f"bytes 0-{file_size - 1}/{file_size}",
-        "Content-Type": "video/mp4",
-    }
-    put_res = requests.put(upload_url, headers=put_headers, data=video_bytes, timeout=120)
+        put_res = requests.put(
+            upload_url,
+            headers={
+                "Content-Range": f"bytes 0-{file_size - 1}/{file_size}",
+                "Content-Type": "video/mp4",
+            },
+            data=vf.read(),
+            timeout=120,
+        )
     if put_res.status_code in (200, 201):
-        return f"Uploaded to Creator Inbox (publish_id: {publish_id})"
+        return f"Uploaded to Creator Inbox (publish_id: {data.get('publish_id', '')})"
     return f"TikTok Upload HTTP {put_res.status_code}: {put_res.text}"
 
 
 def main() -> None:
-    if not CAMPAIGN_URL:
-        raise ValueError("CAMPAIGN_URL environment variable is empty.")
+    used_items = load_used_items()
+    source_path, item_key = download_from_google_drive(VIDEO_URL, used_items)
+    total_duration = get_video_duration(source_path)
+    print(f"Downloaded from Google Drive: {item_key} ({total_duration}s)")
 
-    cfg = load_campaign_config(CAMPAIGN_URL, EXTRA_BRIEF_NOTES)
-    used_ids = load_used_videos()
-
-    video_id, video_url, context_text, total_duration = find_candidate_with_context(
-        CAMPAIGN_URL, cfg, used_ids
-    )
-    print(f"Selected source video: {video_url} ({total_duration}s)")
-
-    plan = analyze_with_gemini(context_text, total_duration, cfg)
+    plan = analyze_video_with_gemini(source_path, total_duration, CAMPAIGN_NOTES)
     print(f"Gemini selected {plan['start_sec']}s for {plan['duration_sec']}s")
 
     vo_file = "voiceover.mp3"
     final_file = "final_short.mp4"
     asyncio.run(generate_voiceover(plan["voiceover_script"], vo_file))
-    download_and_render_clip(
-        video_url, plan["start_sec"], plan["duration_sec"], vo_file, final_file
+    render_vertical_clip(
+        source_path,
+        plan["start_sec"],
+        plan["duration_sec"],
+        plan.get("overlay_tag", "#ad | Code FPMOVEMENT"),
+        vo_file,
+        final_file,
     )
 
     youtube = get_youtube_upload_client()
     yt_url = upload_to_youtube(youtube, final_file, plan["title"], plan["caption"])
     tt_status = upload_to_tiktok_inbox(final_file)
 
-    save_used_video(video_id)
+    save_used_item(item_key)
 
     summary = f"""
 === RUN COMPLETE ===
-Campaign: {cfg.get('name', 'Campaign')}
-Source Video: {video_url}
+Drive Source: {item_key}
 YouTube Shorts: {yt_url}
 TikTok Status: {tt_status}
 Caption: {plan['caption']}
