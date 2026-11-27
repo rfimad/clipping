@@ -1,39 +1,43 @@
-name: Run Campaign Clipper (1-Link Mode)
+name: CapitalDecoded Clipper (1-Link Mode)
 
 on:
   workflow_dispatch:
     inputs:
       campaign_url:
-        description: 'Paste Content Rewards Campaign URL (e.g., https://contentrewards.com/c/campaigns/c0c37381-...)'
+        description: "Paste Content Rewards Campaign URL (e.g., https://contentrewards.com/c/campaigns/c0c37381-...)"
         required: true
         type: string
       extra_brief_notes:
-        description: 'Optional: Paste brief text ONLY if this is a brand-new campaign not in campaigns_db.json'
+        description: "Optional: Paste brief text ONLY if this is a brand-new campaign not in campaigns_db.json"
         required: false
-        default: ''
+        default: ""
         type: string
+
+permissions:
+  contents: write
 
 jobs:
   auto-clip-and-publish:
     runs-on: ubuntu-latest
-    permissions:
-      contents: write   # Allows agent to save used_videos.txt so it never repeats a video
-    steps:
-      - uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set Up Python
+        uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: "3.11"
 
       - name: Install FFmpeg & Python Packages
         run: |
           sudo apt-get update && sudo apt-get install -y ffmpeg
-          pip install yt-dlp edge-tts google-genai google-api-python-client google-auth-oauthlib requests
+          pip install --upgrade yt-dlp edge-tts google-genai google-api-python-client google-auth-oauthlib requests youtube-transcript-api
 
       - name: Discover Footage, Clip, Re-Voice & Publish
         env:
-          CAMPAIGN_URL: ${{ inputs.campaign_url }}
-          EXTRA_BRIEF: ${{ inputs.extra_brief_notes }}
+          CAMPAIGN_URL: ${{ github.event.inputs.campaign_url }}
+          EXTRA_BRIEF_NOTES: ${{ github.event.inputs.extra_brief_notes }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           YT_CLIENT_ID: ${{ secrets.YT_CLIENT_ID }}
           YT_CLIENT_SECRET: ${{ secrets.YT_CLIENT_SECRET }}
@@ -43,8 +47,7 @@ jobs:
 
       - name: Save Processed Video History
         run: |
-          git config user.name "clipper-bot"
-          git config user.email "bot@users.noreply.github.com"
-          git add used_videos.txt campaigns_db.json
-          git commit -m "Log clipped video" || exit 0
-          git push
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          git add used_videos.txt
+          git diff --quiet && git diff --staged --quiet || (git commit -m "Log processed video ID" && git push)
