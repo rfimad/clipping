@@ -1,224 +1,335 @@
 import os
 import re
-import glob
 import json
 import asyncio
 import subprocess
 import requests
 import edge_tts
+from youtube_transcript_api import YouTubeTranscriptApi
 from google import genai
+from google.oauth2.credentials import Credentials
+from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
-from google.oauth2.credentials import Credentials
 
-CAMPAIGN_URL = os.environ["CAMPAIGN_URL"].strip()
-EXTRA_BRIEF = os.environ.get("EXTRA_BRIEF", "").strip()
-client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+# 1. Load environment inputs & secrets
+CAMPAIGN_URL = os.environ.get("CAMPAIGN_URL", "").strip()
+EXTRA_BRIEF_NOTES = os.environ.get("EXTRA_BRIEF_NOTES", "").strip()
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
+YT_CLIENT_ID = os.environ.get("YT_CLIENT_ID", "").strip()
+YT_CLIENT_SECRET = os.environ.get("YT_CLIENT_SECRET", "").strip()
+YT_REFRESH_TOKEN = os.environ.get("YT_REFRESH_TOKEN", "").strip()
+TIKTOK_ACCESS_TOKEN = os.environ.get("TIKTOK_ACCESS_TOKEN", "").strip()
 
-# 1. Extract Campaign ID from URL & load or auto-register campaign rules
-match = re.search(r"campaigns/([a-zA-Z0-9-]+)", CAMPAIGN_URL)
-campaign_id = match.group(1) if match else CAMPAIGN_URL
+USED_VIDEOS_FILE = "used_videos.txt"
+CAMPAIGNS_DB_FILE = "campaigns_db.json"
+VOICE_NAME = "en-US-BrianNeural"
 
-with open("campaigns_db.json", "r", encoding="utf-8") as f:
-    db = json.load(f)
 
-if campaign_id in db:
-    cfg = db[campaign_id]
-else:
-    # Auto-extract rules via Gemini if you pasted a new campaign's brief text
-    parse_prompt = f"""
-    Extract campaign details into valid JSON with keys:
-    "brand", "youtube_handles" (list of official YouTube channel /videos URLs), "promo_code", "discount_text", "mention", "hashtag", "min_seconds" (int, default 22).
-    Campaign URL: {CAMPAIGN_URL}
-    Brief Notes: {EXTRA_BRIEF}
-    """
-    cfg = json.loads(client.models.generate_content(
-        model="gemini-2.5-flash",
-        contents=parse_prompt,
-        config={"response_mime_type": "application/json"}
-    ).text)
-    db[campaign_id] = cfg
-    with open("campaigns_db.json", "w", encoding="utf-8") as f:
-        json.dump(db, f, indent=2)
+def load_used_videos() -> set:
+    if not os.path.exists(USED_VIDEOS_FILE):
+        return set()
+    with open(USED_VIDEOS_FILE, "r", encoding="utf-8") as f:
+        return {line.strip() for line in f if line.strip()}
 
-# 2. Auto-discover latest unused YouTube video from the brand's official channel
-used_ids = set()
-if os.path.exists("used_videos.txt"):
-    with open("used_videos.txt", "r", encoding="utf-8") as f:
-        used_ids = {line.strip() for line in f if line.strip()}
 
-target_video_url = None
-target_video_id = None
+def save_used_video(video_id: str) -> None:
+    with open(USED_VIDEOS_FILE, "a", encoding="utf-8") as f:
+        f.write(f"{video_id}\n")
 
-for feed_url in cfg["youtube_handles"]:
-    res = subprocess.run([
-        "yt-dlp", "--flat-playlist", "--playlist-end", "15",
-        "--print", "%(id)s|%(duration)s|%(title)s",
-        feed_url
-    ], capture_output=True, text=True)
-    for line in res.stdout.splitlines():
-        parts = line.split("|", 2)
-        if len(parts) < 2:
-            continue
-        vid_id, dur_str = parts[0].strip(), parts[1].strip()
-        try:
-            dur = float(dur_str)
-        except ValueError:
-            dur = 60.0
-        # Pick videos >= 45s that haven't been clipped yet
-        if vid_id not in used_ids and dur >= 45:
-            target_video_id = vid_id
-            target_video_url = f"https://www.youtube.com/watch?v={vid_id}"
-            break
-    if target_video_url:
-        break
 
-if not target_video_url:
-    raise RuntimeError("No unused source videos found on brand channel—add a backup YouTube URL to campaigns_db.json.")
+def load_campaign_config(campaign_url: str, extra_notes: str) -> dict:
+    db = {}
+    if os.path.exists(CAMPAIGNS_DB_FILE):
+        with open(CAMPAIGNS_DB_FILE, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+            db = raw if isinstance(raw, dict) else {c.get("url", ""): c for c in raw}
 
-print(f"Auto-selected source video: {target_video_url}")
+    for key, val in db.items():
+        if key and (key in campaign_url or campaign_url in key):
+            cfg = dict(val)
+            if extra_notes:
+                cfg["brief"] = f"{cfg.get('brief', '')}\n{extra_notes}".strip()
+            return cfg
 
-# 3. Fetch ONLY text transcript (0 MB video download) to pick best 30-second moment
-subprocess.run([
-    "yt-dlp", "--write-auto-sub", "--write-sub",
-    "--sub-lang", "en", "--skip-download",
-    "-o", "transcript", target_video_url
-], check=False)
+    # Fallback if a brand-new campaign URL is pasted with brief notes
+    return {
+        "name": "Fundingpips Clipping",
+        "promo_code": "FPMOVEMENT",
+        "discount": "20% off",
+        "search_queries": [
+            "prop firm funded trader payout interview podcast",
+            "forex funded trader strategy podcast",
+        ],
+        "brief": extra_notes
+        or "Highlight funded trading discipline, risk management, and mention code FPMOVEMENT for 20% off.",
+    }
 
-sub_files = glob.glob("transcript*.vtt")
-transcript_text = ""
-if sub_files:
-    with open(sub_files[0], "r", encoding="utf-8", errors="ignore") as f:
-        transcript_text = f.read()[:28000]
 
-analysis_prompt = f"""
-You are a viral finance & prop-trading editor for {cfg['brand']}.
-Pick the single highest-retention 28 to 32 second window from this transcript (avoid intros/outros; if transcript is empty use "00:01:15" to "00:01:45").
-Return ONLY valid JSON with:
-- "start": "HH:MM:SS"
-- "end": "HH:MM:SS" (must be 28-32 seconds after start)
-- "title": punchy 50-char YouTube Shorts title (no quotes, no hashtags)
-- "voiceover": 3-sentence authoritative US-English voiceover script (50-58 words) summarizing the trading/payout insight, ending naturally with: Use code {" ".join(cfg['promo_code'])} for twenty percent off.
+def extract_video_id(url: str) -> str | None:
+    patterns = [
+        r"(?:v=|\/shorts\/|youtu\.be\/)([A-Za-z0-9_-]{11})",
+    ]
+    for pat in patterns:
+        m = re.search(pat, url)
+        if m:
+            return m.group(1)
+    return None
+
+
+def find_candidate_video(campaign_url: str, cfg: dict, used_ids: set) -> tuple[str, str]:
+    direct_id = extract_video_id(campaign_url)
+    if direct_id:
+        return direct_id, f"https://www.youtube.com/watch?v={direct_id}"
+
+    queries = cfg.get("search_queries") or [
+        "prop firm funded trader interview podcast",
+        "day trading risk management podcast",
+    ]
+    for query in queries:
+        cmd = [
+            "yt-dlp",
+            f"ytsearch10:{query}",
+            "--print",
+            "%(id)s|%(duration)s",
+            "--no-warnings",
+            "--ignore-errors",
+        ]
+        res = subprocess.run(cmd, capture_output=True, text=True)
+        for line in res.stdout.splitlines():
+            parts = line.strip().split("|")
+            if len(parts) != 2:
+                continue
+            vid, dur_str = parts
+            if vid in used_ids or not dur_str.isdigit():
+                continue
+            dur = int(dur_str)
+            # Prefer long-form podcast/interview videos (5 min to 3 hrs)
+            if 300 <= dur <= 10800:
+                return vid, f"https://www.youtube.com/watch?v={vid}"
+
+    raise RuntimeError("No unused candidate YouTube videos found for campaign queries.")
+
+
+def fetch_transcript(video_id: str) -> list[dict]:
+    api = YouTubeTranscriptApi()
+    transcript = api.fetch(video_id, languages=["en", "en-US", "en-GB"])
+    return [
+        {"start": item.start, "duration": item.duration, "text": item.text}
+        for item in transcript
+    ]
+
+
+def analyze_with_gemini(transcript: list[dict], cfg: dict) -> dict:
+    client = genai.Client(api_key=GEMINI_API_KEY)
+    compact_lines = [
+        f"[{int(seg['start'])}s] {seg['text']}"
+        for seg in transcript
+        if seg["start"] <= 3600
+    ]
+    transcript_block = "\n".join(compact_lines[:450])
+
+    prompt = f"""
+You are a viral short-form finance & trading editor for @capitaldecoded13.
+Analyze the podcast transcript below and pick ONE high-retention 28-to-35 second segment.
+
+Campaign: {cfg.get('name', 'Fundingpips Clipping')}
+Promo Code: {cfg.get('promo_code', 'FPMOVEMENT')} ({cfg.get('discount', '20% off')})
+Brief Rules: {cfg.get('brief', '')}
+
+Return ONLY valid JSON with these exact keys:
+{{
+  "start_sec": <integer start timestamp in seconds>,
+  "duration_sec": <integer between 28 and 35>,
+  "voiceover_script": "<punchy 65-75 word US English narration summarizing the insight and naturally mentioning code {cfg.get('promo_code', 'FPMOVEMENT')} for {cfg.get('discount', '20% off')}>",
+  "title": "<YouTube Shorts title under 70 chars including #Shorts #ad>",
+  "caption": "<TikTok/Shorts description with #ad #trading #propfirm #finance and promo code {cfg.get('promo_code', 'FPMOVEMENT')}>"
+}}
 
 Transcript:
-{transcript_text}
+{transcript_block}
 """
+    response = client.models.generate_content(
+        model="gemini-2.5-flash",
+        contents=prompt,
+        config={"response_mime_type": "application/json"},
+    )
+    data = json.loads(response.text)
+    data["start_sec"] = max(0, int(data.get("start_sec", 60)))
+    data["duration_sec"] = min(40, max(25, int(data.get("duration_sec", 30))))
+    return data
 
-plan = json.loads(client.models.generate_content(
-    model="gemini-2.5-flash",
-    contents=analysis_prompt,
-    config={"response_mime_type": "application/json"}
-).text)
 
-start_ts = plan.get("start", "00:01:15")
-end_ts = plan.get("end", "00:01:45")
-raw_title = plan.get("title", f"How {cfg['brand']} Traders Scale Capital")[:75]
-voiceover_script = plan["voiceover"]
+async def generate_voiceover(text: str, out_mp3: str) -> None:
+    communicate = edge_tts.Communicate(text, VOICE_NAME, rate="+6%")
+    await communicate.save(out_mp3)
 
-# 4. Slice ONLY those 30 seconds
-subprocess.run([
-    "yt-dlp",
-    "--download-sections", f"*{start_ts}-{end_ts}",
-    "-f", "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]",
-    "--merge-output-format", "mp4",
-    "-o", "raw_slice.mp4",
-    target_video_url
-], check=True)
 
-# 5. Generate crisp US male voiceover + synced captions (Free edge-tts)
-async def build_tts():
-    comm = edge_tts.Communicate(voiceover_script, "en-US-BrianNeural", rate="+5%")
-    subs = edge_tts.SubMaker()
-    with open("voiceover.mp3", "wb") as af:
-        async for chunk in comm.stream():
-            if chunk["type"] == "audio":
-                af.write(chunk["data"])
-            elif chunk["type"] == "WordBoundary":
-                subs.feed(chunk)
-    with open("captions.srt", "w", encoding="utf-8") as sf:
-        sf.write(subs.get_srt())
+def download_and_render_clip(
+    video_url: str, start_sec: int, duration_sec: int, vo_mp3: str, final_mp4: str
+) -> None:
+    raw_clip = "raw_slice.mp4"
+    end_sec = start_sec + duration_sec
 
-asyncio.run(build_tts())
+    dl_cmd = [
+        "yt-dlp",
+        "-f",
+        "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+        "--download-sections",
+        f"*{start_sec}-{end_sec}",
+        "--force-keyframes-at-cuts",
+        "-o",
+        raw_clip,
+        video_url,
+    ]
+    subprocess.run(dl_cmd, check=True)
 
-# 6. Mute original speaker, crop 9:16, add #ad + yellow captions
-vf_filter = (
-    "crop=ih*9/16:ih,scale=1080:1920,"
-    "eq=contrast=1.04:saturation=1.05,"
-    "drawtext=text='#ad':fontcolor=white:fontsize=36:x=40:y=80:enable='between(t,0,3)',"
-    "subtitles=captions.srt:force_style='Alignment=2,MarginV=340,Fontsize=18,PrimaryColour=&H0000FFFF,Outline=2'"
-)
+    # Vertical 1080x1920 crop, mute original audio, mix US voiceover, burn #ad disclosure
+    vf_filter = (
+        "scale=1080:1920:force_original_aspect_ratio=increase,"
+        "crop=1080:1920,"
+        "drawtext=text='#ad | Code\\: FPMOVEMENT':fontcolor=white:fontsize=34:"
+        "box=1:boxcolor=black@0.55:boxborderw=10:x=40:y=60"
+    )
+    ff_cmd = [
+        "ffmpeg",
+        "-y",
+        "-i",
+        raw_clip,
+        "-i",
+        vo_mp3,
+        "-filter_complex",
+        f"[0:v]{vf_filter}[v]",
+        "-map",
+        "[v]",
+        "-map",
+        "1:a",
+        "-c:v",
+        "libx264",
+        "-preset",
+        "veryfast",
+        "-crf",
+        "23",
+        "-c:a",
+        "aac",
+        "-b:a",
+        "128k",
+        "-shortest",
+        final_mp4,
+    ]
+    subprocess.run(ff_cmd, check=True)
 
-subprocess.run([
-    "ffmpeg", "-y",
-    "-i", "raw_slice.mp4", "-i", "voiceover.mp3",
-    "-map", "0:v:0", "-map", "1:a:0",
-    "-vf", vf_filter,
-    "-c:v", "libx264", "-preset", "fast", "-crf", "22",
-    "-c:a", "aac", "-b:a", "128k",
-    "-shortest", "final_short.mp4"
-], check=True)
 
-caption_text = f"{raw_title}. {cfg['discount_text']} {cfg['mention']} {cfg['hashtag']} #ad #trading #propfirm"
-
-# 7. Publish Publicly to YouTube Shorts
-yt_url = "Not configured"
-if os.environ.get("YT_REFRESH_TOKEN"):
+def upload_to_youtube(video_path: str, title: str, description: str) -> str:
     creds = Credentials(
         token=None,
-        refresh_token=os.environ["YT_REFRESH_TOKEN"],
+        refresh_token=YT_REFRESH_TOKEN,
         token_uri="https://oauth2.googleapis.com/token",
-        client_id=os.environ["YT_CLIENT_ID"],
-        client_secret=os.environ["YT_CLIENT_SECRET"]
+        client_id=YT_CLIENT_ID,
+        client_secret=YT_CLIENT_SECRET,
+        scopes=["https://www.googleapis.com/auth/youtube.upload"],
     )
+    creds.refresh(Request())
     youtube = build("youtube", "v3", credentials=creds)
-    yt_res = youtube.videos().insert(
-        part="snippet,status",
-        body={
-            "snippet": {
-                "title": f"{raw_title} #Shorts",
-                "description": caption_text,
-                "categoryId": "27"
-            },
-            "status": {"privacyStatus": "public", "selfDeclaredMadeForKids": False}
-        },
-        media_body=MediaFileUpload("final_short.mp4", chunksize=-1, resumable=True)
-    ).execute()
-    yt_url = f"https://youtube.com/shorts/{yt_res['id']}"
 
-# 8. Upload to TikTok Creator Inbox (Zero audit required)
-tiktok_status = "Not configured"
-if os.environ.get("TIKTOK_ACCESS_TOKEN"):
-    fsize = os.path.getsize("final_short.mp4")
+    body = {
+        "snippet": {
+            "title": title[:95],
+            "description": description,
+            "tags": ["Shorts", "ad", "trading", "finance", "propfirm"],
+            "categoryId": "27",
+        },
+        "status": {
+            "privacyStatus": "public",
+            "selfDeclaredMadeForKids": False,
+        },
+    }
+    media = MediaFileUpload(video_path, chunksize=-1, resumable=True, mimetype="video/mp4")
+    req = youtube.videos().insert(part="snippet,status", body=body, media_body=media)
+    resp = req.execute()
+    vid = resp.get("id", "")
+    return f"https://youtube.com/shorts/{vid}"
+
+
+def upload_to_tiktok_inbox(video_path: str) -> str:
+    if not TIKTOK_ACCESS_TOKEN:
+        return "Skipped (TIKTOK_ACCESS_TOKEN not set)"
+
+    file_size = os.path.getsize(video_path)
+    headers = {
+        "Authorization": f"Bearer {TIKTOK_ACCESS_TOKEN}",
+        "Content-Type": "application/json; charset=UTF-8",
+    }
+    init_payload = {
+        "source_info": {
+            "source": "FILE_UPLOAD",
+            "video_size": file_size,
+            "chunk_size": file_size,
+            "total_chunk_count": 1,
+        }
+    }
     init_res = requests.post(
         "https://open.tiktokapis.com/v2/post/publish/inbox/video/init/",
-        headers={
-            "Authorization": f"Bearer {os.environ['TIKTOK_ACCESS_TOKEN']}",
-            "Content-Type": "application/json; charset=utf-8"
-        },
-        json={"source_info": {"source": "FILE_UPLOAD", "video_size": fsize, "chunk_size": fsize, "total_chunk_count": 1}}
+        headers=headers,
+        json=init_payload,
+        timeout=30,
     ).json()
-    upload_url = init_res.get("data", {}).get("upload_url")
-    if upload_url:
-        with open("final_short.mp4", "rb") as vf:
-            put_res = requests.put(
-                upload_url,
-                headers={"Content-Range": f"bytes 0-{fsize - 1}/{fsize}", "Content-Length": str(fsize), "Content-Type": "video/mp4"},
-                data=vf
-            )
-        tiktok_status = f"Sent to TikTok Inbox (HTTP {put_res.status_code})"
-    else:
-        tiktok_status = f"TikTok Error: {init_res}"
 
-# 9. Log video ID so future runs automatically pick a new video
-with open("used_videos.txt", "a", encoding="utf-8") as uf:
-    uf.write(f"{target_video_id}\n")
+    data = init_res.get("data", {})
+    upload_url = data.get("upload_url")
+    publish_id = data.get("publish_id", "")
+    if not upload_url:
+        return f"TikTok Init Warning: {init_res}"
 
-summary = f"""
-## Campaign Clip Published ({cfg['brand']})
-- **Source Video:** {target_video_url} (`{start_ts}` → `{end_ts}`)
-- **YouTube Shorts Live URL (Copy & Submit):** {yt_url}
-- **TikTok Status:** {tiktok_status}
+    with open(video_path, "rb") as vf:
+        video_bytes = vf.read()
 
-### Copy-Paste Caption for TikTok & Content Rewards:
-```text
-{caption_text}
+    put_headers = {
+        "Content-Range": f"bytes 0-{file_size - 1}/{file_size}",
+        "Content-Type": "video/mp4",
+    }
+    put_res = requests.put(upload_url, headers=put_headers, data=video_bytes, timeout=120)
+    if put_res.status_code in (200, 201):
+        return f"Uploaded to Creator Inbox (publish_id: {publish_id})"
+    return f"TikTok Upload HTTP {put_res.status_code}: {put_res.text}"
+
+
+def main() -> None:
+    if not CAMPAIGN_URL:
+        raise ValueError("CAMPAIGN_URL environment variable is empty.")
+
+    cfg = load_campaign_config(CAMPAIGN_URL, EXTRA_BRIEF_NOTES)
+    used_ids = load_used_videos()
+
+    video_id, video_url = find_candidate_video(CAMPAIGN_URL, cfg, used_ids)
+    print(f"Selected source video: {video_url}")
+
+    transcript = fetch_transcript(video_id)
+    plan = analyze_with_gemini(transcript, cfg)
+    print(f"Gemini selected {plan['start_sec']}s for {plan['duration_sec']}s")
+
+    vo_file = "voiceover.mp3"
+    final_file = "final_short.mp4"
+    asyncio.run(generate_voiceover(plan["voiceover_script"], vo_file))
+    download_and_render_clip(
+        video_url, plan["start_sec"], plan["duration_sec"], vo_file, final_file
+    )
+
+    yt_url = upload_to_youtube(final_file, plan["title"], plan["caption"])
+    tt_status = upload_to_tiktok_inbox(final_file)
+
+    save_used_video(video_id)
+
+    summary = f"""
+=== RUN COMPLETE ===
+Campaign: {cfg.get('name', 'Campaign')}
+Source Video: {video_url}
+YouTube Shorts: {yt_url}
+TikTok Status: {tt_status}
+Caption: {plan['caption']}
+"""
+    print(summary)
+
+
+if __name__ == "__main__":
+    main()
